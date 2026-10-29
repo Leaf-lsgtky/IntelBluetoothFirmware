@@ -69,10 +69,20 @@ static KernelPatcher::KextInfo IntelBTPatcher_IOUsbHostInfo {
 void *CIntelBTPatcher::_hookPipeInstance = nullptr;
 bool CIntelBTPatcher::_randomAddressInit = false;
 
+// bluetoothd cancels the running inquiry and issues HCI_Create_Connection from another
+// thread in the same millisecond. The AX210 answers that create with Command Disallowed
+// (0x0C, which bluetoothd reports as status 712) until the inquiry has actually stopped,
+// so the first few attempts fail in ~2 ms and the user has to click Connect several times.
+// Hold the create that follows a cancel long enough for the cancel to land.
+static bool inquiryCancelPending = false;
+// -ibtnoinqdelay turns the workaround off without rebuilding.
+static bool noInquiryDelay = false;
+
 bool CIntelBTPatcher::init()
 {
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
     callbackIBTPatcher = this;
+    noInquiryDelay = checkKernelArgument("-ibtnoinqdelay");
     if (getKernelVersion() < KernelVersion::Monterey) {
         lilu.onKextLoadForce(&IntelBTPatcher_IOBluetoothInfo, 1,
         [](void *user, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -196,6 +206,8 @@ IOBufferMemoryDescriptor *writeHCIDescriptor = nullptr;
 
 #define MAX_HCI_BUF_LEN                 255
 #define HCI_OP_RESET                    0x0c03
+#define HCI_OP_INQUIRY_CANCEL           0x0402
+#define HCI_OP_CREATE_CONNECTION        0x0405
 #define HCI_OP_LE_SET_SCAN_PARAM        0x200B
 #define HCI_OP_LE_SET_SCAN_ENABLE       0x200C
 
@@ -246,6 +258,13 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
         // HCI reset, we need to send Random address again
         if (hdr->opcode == HCI_OP_RESET)
             _randomAddressInit = false;
+        if (hdr->opcode == HCI_OP_INQUIRY_CANCEL) {
+            inquiryCancelPending = true;
+        } else if (hdr->opcode == HCI_OP_CREATE_CONNECTION && inquiryCancelPending) {
+            inquiryCancelPending = false;
+            if (!noInquiryDelay)
+                IOSleep(50);
+        }
 #if DEBUG
         DBGLOG(DRV_NAME, "[%s] bRequest: 0x%x direction: %s type: %s recipient: %s wValue: 0x%02x wIndex: 0x%02x opcode: 0x%04x len: %d length: %d async: %d", provider->getName(), request.bRequest, requestDirectionNames[(request.bmRequestType & kDeviceRequestDirectionMask) >> kDeviceRequestDirectionPhase], requestRecipientNames[(request.bmRequestType & kDeviceRequestRecipientMask) >> kDeviceRequestRecipientPhase], requestTypeNames[(request.bmRequestType & kDeviceRequestTypeMask) >> kDeviceRequestTypePhase], request.wValue, request.wIndex, hdr->opcode, hdr->len, request.wLength, completion != nullptr);
         if (hdrLen) {

@@ -36,6 +36,16 @@ typedef struct __attribute__((packed))
     uint8_t     data[];
 } HciEventHdr;
 
+// HCI Command Complete event: evt(0x0E), plen, num_hci_command_packets, opcode, return params.
+typedef struct __attribute__((packed))
+{
+    uint8_t     evt;
+    uint8_t     len;
+    uint8_t     numCommands;
+    uint16_t    opcode;
+    uint8_t     data[];
+} HciResponse;
+
 const char *requestDirectionNames[] = {
     "OUT",
     "IN"

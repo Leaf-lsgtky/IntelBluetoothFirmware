@@ -198,9 +198,7 @@ IOBufferMemoryDescriptor *writeHCIDescriptor = nullptr;
 #define HCI_OP_RESET                    0x0c03
 #define HCI_OP_LE_SET_SCAN_PARAM        0x200B
 #define HCI_OP_LE_SET_SCAN_ENABLE       0x200C
-#define HCI_OP_LE_READ_REMOTE_FEATURES  0x2016
 
-int remoteReadSCount = 0;
 IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
 {
     HciCommandHdr *hdr = nullptr;
@@ -239,12 +237,6 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
                 _randomAddressInit = true;
                 SYSLOG(DRV_NAME, "[PATCH] Resend LE SCAN PARAM HCI %d", ret);
             }
-        } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES) {
-            // #514: send TWO extra reads -> two duplicate 0x04 events to rewrite
-            // (1st dup -> fake PHY Update Complete, 2nd dup -> fake LE Data Length Change).
-            remoteReadSCount += 2;
-            FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
-            FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
         }
     } else {
         hdr = (HciCommandHdr *)data;
@@ -268,24 +260,15 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
     return FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, data, descriptor, length, completion, timeout);
 }
 
-#define HCI_EVT_LE_META                               0x3E
-#define HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE 0x04
-
-uint8_t fakePhyUpdateCompleteEvent[8] = {0x3E, 0x06, 0x0C, 0x00, 0x00, 0x00, 0x02, 0x02};
-// #514: LE Data Length Change (LE Meta subevent 0x07, no status byte -> handle at [3][4]).
-// bluetoothd stalls at LE_READY_WAIT_FOR_LENGTH after PHY until it sees this. 27 octets / 328us tx+rx.
-// Made by Claude.
-uint8_t fakeDataLengthChangeEvent[13] = {0x3E, 0x0B, 0x07, 0x00, 0x00, 0x1B, 0x00, 0x48, 0x01, 0x1B, 0x00, 0x48, 0x01};
-//uint8_t remoteFeaturesStatus[6] = {0x0F, 0x04, 0x00, 0x01, 0x16, 0x20};
+// Succeeded HCI command result of HCI_OP_LE_SET_SCAN_ENABLE. On Monterey+ the controller
+// answers status 0x12 (Invalid HCI Command Parameters) when the random address was not set
+// before, which makes bluetoothd treat the LE stack as failed and restart itself in a loop.
+static const uint8_t fakeLEScanEnableResp[6] = {0x0E, 0x04, 0x02, 0x0C, 0x20, 0x00};
 
 static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uint32_t bytesTransferred)
 {
     AsyncOwnerData *asyncOwner = (AsyncOwnerData *)owner;
     IOMemoryDescriptor* dataBuffer = asyncOwner->dataBuffer;
-    // #514 3-stage rewrite of the repeated LE Read Remote Features Complete (0x04) events:
-    //   stage 0 = the real one (pass through), 1 = rewrite to fake PHY Update Complete,
-    //   2 = rewrite to fake LE Data Length Change (clears bluetoothd's LE_READY_WAIT_FOR_LENGTH).
-    static int leMetaStage = 0;
     uint32_t allocLen = bytesTransferred;
 
     if (dataBuffer && bytesTransferred) {
@@ -293,25 +276,12 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
         if (buffer) {
             if (dataBuffer->getLength() > 0 && (getKernelVersion() < KernelVersion::Sequoia || !dataBuffer->prepare(kIODirectionInOut))) {
                 dataBuffer->readBytes(0, buffer, allocLen);
-                HciEventHdr *hdr = (HciEventHdr *)buffer;
-                if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
-                    if (leMetaStage == 0) {
-                        leMetaStage = 1;            // real features complete -> pass through
-                    } else if (leMetaStage == 1) {  // 1st duplicate -> fake PHY Update Complete
-                        fakePhyUpdateCompleteEvent[4] = hdr->data[2];
-                        fakePhyUpdateCompleteEvent[5] = hdr->data[3];
-                        dataBuffer->writeBytes(0, fakePhyUpdateCompleteEvent, 8);
-                        bytesTransferred = 8;
-                        leMetaStage = 2;
-                        remoteReadSCount--;
-                    } else {                        // 2nd duplicate -> fake LE Data Length Change
-                        fakeDataLengthChangeEvent[3] = hdr->data[2];
-                        fakeDataLengthChangeEvent[4] = hdr->data[3];
-                        dataBuffer->writeBytes(0, fakeDataLengthChangeEvent, 13);
-                        bytesTransferred = 13;
-                        leMetaStage = 0;
-                        remoteReadSCount--;
-                    }
+                HciResponse *resp = (HciResponse *)buffer;
+                // v2.2.0 behaviour: turn a failed LE Set Scan Enable into a success response.
+                if (allocLen >= sizeof(HciResponse) + 1 &&
+                    resp->evt == 0x0E && resp->opcode == HCI_OP_LE_SET_SCAN_ENABLE && resp->data[0]) {
+                    SYSLOG(DRV_NAME, "[FAKE RESP]: done");
+                    dataBuffer->writeBytes(0, fakeLEScanEnableResp, sizeof(fakeLEScanEnableResp));
                 }
                 if (getKernelVersion() >= KernelVersion::Sequoia) dataBuffer->complete(kIODirectionInOut);
             }
@@ -326,7 +296,7 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
 IOReturn CIntelBTPatcher::
 newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
-    if (remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
+    if (that == _hookPipeInstance && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = completion->action;
         ownerData->owner = completion->owner;
@@ -346,8 +316,12 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
     const StandardUSB::DeviceDescriptor *deviceDescriptor = device->getDeviceDescriptor();
     if (deviceDescriptor && deviceDescriptor->idVendor == VENDOR_USB_INTEL) {
         uint8_t epType = StandardUSB::getEndpointType(descriptor);
-        if (epType == kIOUSBEndpointTypeInterrupt)
+        if (epType == kIOUSBEndpointTypeInterrupt) {
             CIntelBTPatcher::_hookPipeInstance = that;
+            // The interrupt pipe is re-created whenever the transport restarts, so the
+            // random address has to be pushed again on the next LE Set Scan Parameters.
+            CIntelBTPatcher::_randomAddressInit = false;
+        }
     }
 }
 
